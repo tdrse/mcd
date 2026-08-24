@@ -127,16 +127,40 @@ static void set_status_errno(const char *action)
 static void leave_ui(void)
 {
     if (ui_active) {
-        fputs("\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l", stderr);
+        fputs("\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[6n", stderr);
+        fflush(stderr);
         ui_active = 0;
+
+        struct timeval timeout;
+        fd_set fds;
+        char sync_buf;
+
+        while (1) {
+            FD_ZERO(&fds);
+            FD_SET(STDIN_FILENO, &fds);
+
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 50000;
+
+            int ret = select(STDIN_FILENO + 1, &fds, NULL, NULL, &timeout);
+
+            if (ret > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
+                if (read(STDIN_FILENO, &sync_buf, 1) > 0) {
+                    if (sync_buf == 'R') {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
     }
 
     if (raw_enabled) {
+        tcflush(STDIN_FILENO, TCIFLUSH);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_enabled = 0;
     }
-
-    fflush(stderr);
 }
 
 static void sig_handler(int sig)
@@ -272,7 +296,6 @@ static void query_clean(void)
     rebuild_all();
 }
 
-
 static void add_custom_path(const char *s)
 {
     if (!s || !*s) return;
@@ -360,10 +383,6 @@ static int canonicalize_path(const char *in, char *out, size_t outsz)
         return 0;
     }
 
-    /*
-     * -P / physical_mode:
-     * 跟随符号链接，解析物理路径。
-     */
     if (physical_mode) {
         if (!realpath(in, out)) {
             set_status_errno("realpath");
@@ -385,10 +404,6 @@ static int canonicalize_path(const char *in, char *out, size_t outsz)
         return 1;
     }
 
-    /*
-     * 默认模式：
-     * 保留逻辑路径，不用 realpath。
-     */
     int n = snprintf(out, outsz, "%s", in);
 
     if (n < 0 || (size_t)n >= outsz) {
@@ -422,10 +437,7 @@ static void get_initial_cwd(char *out, size_t outsz)
 {
     if (!out || outsz == 0) return;
 
-    /*
-     * 默认优先使用 shell 的 PWD。
-     * 这样可以保留通过 symlink 进入的逻辑路径。
-     */
+    /* 使用 PWD 获取逻辑路径 */
     if (!physical_mode) {
         const char *pwd = getenv("PWD");
 
