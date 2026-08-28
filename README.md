@@ -161,4 +161,4 @@ Example `~/.mcd_dirs`:
 
 ## License
 
-MIT
+[MIT License](LICENSE)

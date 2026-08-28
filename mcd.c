@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 tdrse
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _GNU_SOURCE
 
 #include <stdio.h>
@@ -44,7 +49,11 @@ enum {
     K_CHAR,
     K_MOUSE,
     K_CTRL_C,
-    K_CTRL_P
+    K_CTRL_P,
+    K_HOME,
+    K_END,
+    K_PGUP,
+    K_PGDN
 };
 
 enum {
@@ -1063,7 +1072,8 @@ static void browse_enter_selected(void)
         set_status("Cannot get selected path");
         return;
     }
-    
+
+    /* include .. */
     query_clean();
     browse_load(full);
 }
@@ -1144,6 +1154,24 @@ static int read_byte_timeout(unsigned char *c, int timeout_ms)
     }
 }
 
+static void flush_stdin(void)
+{
+    unsigned char buf[256];
+    fd_set set;
+    struct timeval tv = {0, 0};
+
+    while (1) {
+        FD_ZERO(&set);
+        FD_SET(STDIN_FILENO, &set);
+        if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) <= 0) {
+            break;
+        }
+        if (read(STDIN_FILENO, buf, sizeof(buf)) <= 0) {
+            break;
+        }
+    }
+}
+
 static int read_key(unsigned char *ch_out, MouseEvent *m)
 {
     if (ch_out) *ch_out = 0;
@@ -1200,14 +1228,51 @@ static int read_key(unsigned char *ch_out, MouseEvent *m)
                 if (c3 == 'B') return K_DOWN;
                 if (c3 == 'C') return K_RIGHT;
                 if (c3 == 'D') return K_LEFT;
+                if (c3 == 'H') return K_HOME;
+                if (c3 == 'F') return K_END;
 
-                unsigned char ch = c3;
+                if (c3 >= '0' && c3 <= '9') {
+                    int num = c3 - '0';
+                    unsigned char ch;
+                    int in_modifier = 0;
+                    while (1) {
+                        r = read_byte_timeout(&ch, 30);
+                        if (r <= 0) return K_NONE;
 
-                while (!(ch >= '@' && ch <= '~')) {
-                    r = read_byte_timeout(&ch, 20);
-                    if (r <= 0) break;
+                        if (ch >= '0' && ch <= '9') {
+                            if (!in_modifier) {
+                                num = num * 10 + (ch - '0');
+                            }
+                        } else if (ch == ';') {
+                            in_modifier = 1;
+                        } else if (ch == '~') {
+                            if (in_modifier) return K_NONE;
+                            switch (num) {
+                            case 1: case 7: return K_HOME;
+                            case 4: case 8: return K_END;
+                            case 5:         return K_PGUP;
+                            case 6:         return K_PGDN;
+                            default:        return K_NONE;
+                            }
+                        } else if (ch >= '@' && ch <= '~') {
+                            return K_NONE;
+                        } else {
+                            return K_NONE;
+                        }
+                    }
                 }
 
+                unsigned char ch_junk = c3;
+                while (!(ch_junk >= '@' && ch_junk <= '~')) {
+                    r = read_byte_timeout(&ch_junk, 20);
+                    if (r <= 0) break;
+                }
+                return K_NONE;
+            }
+
+            if (c2 == 'O') {
+                if (c3 == 'H') return K_HOME;   /* \x1bOH */
+                if (c3 == 'F') return K_END;    /* \x1bOF */
                 return K_NONE;
             }
 
@@ -1528,6 +1593,10 @@ static void draw(void)
     fprintf(stderr, "\x1b[%d;1H\x1b[2K", rows);
     print_clipped(help, cols - 1);
 
+    int query_display_width = visual_width_clipped(query, cols - 3);
+    int cursor_x = 3 + query_display_width;
+    fprintf(stderr, "\x1b[2;%dH", cursor_x);
+
     fflush(stderr);
 }
 
@@ -1592,7 +1661,7 @@ static void init_custom(int have_arg_dirs)
 
 static void usage(const char *prog)
 {
-    printf("mcd: mouse TUI quick cd tool v3.5.1\n\n");
+    printf("mcd: mouse TUI quick cd tool v3.5.2\n\n");
     printf("Usage:\n");
     printf("  %s                 use ~/.mcd_dirs / MCD_FILE / MCD_PATHS / defaults\n", prog);
     printf("  %s [dirs...]       use only given custom dirs\n", prog);
@@ -1694,6 +1763,7 @@ int main(int argc, char **argv)
 
         if (got_winch) {
             got_winch = 0;
+            flush_stdin();
             draw();
             continue;
         }
@@ -1726,7 +1796,7 @@ int main(int argc, char **argv)
         case K_UP: {
             List *l = active_list();
 
-            if (l->sel > 0) {
+            if (l->fn > 0 && l->sel > 0) {
                 l->sel--;
                 ensure_visible(l);
                 need_draw = 1;
@@ -1788,6 +1858,69 @@ int main(int argc, char **argv)
                 set_status("Mode: physical (-P)");
             } else {
                 set_status("Mode: logical");
+            }
+
+            break;
+        }
+
+        case K_HOME: {
+            List *l = active_list();
+
+            if (l->fn > 0 && l->sel > 0) {
+                l->sel = 0;
+                ensure_visible(l);
+                need_draw = 1;
+            } else {
+                need_draw = 0;
+            }
+
+            break;
+        }
+
+        case K_END: {
+            List *l = active_list();
+
+            if (l->fn > 0 && l->sel + 1 < l->fn) {
+                l->sel = l->fn - 1;
+                ensure_visible(l);
+                need_draw = 1;
+            } else {
+                need_draw = 0;
+            }
+
+            break;
+        }
+
+        case K_PGUP: {
+            List *l = active_list();
+
+            if (l->fn > 0 && l->sel > 0 && list_height > 0) {
+                size_t step = (size_t)list_height;
+ 
+                l->sel = (l->sel >= step) ? l->sel - step : 0;
+ 
+                ensure_visible(l);
+                need_draw = 1;
+            } else {
+                need_draw = 0;
+            }
+
+            break;
+        }
+
+        case K_PGDN: {
+            List *l = active_list();
+
+            if (l->fn > 0 && l->sel + 1 < l->fn && list_height > 0) {
+                size_t step = (size_t)list_height;
+                size_t max_idx = l->fn - 1;
+
+                l->sel = (l->sel + step < max_idx) ? l->sel + step : max_idx;
+
+                ensure_visible(l);
+                need_draw = 1;
+            } else {
+                need_draw = 0;
             }
 
             break;
