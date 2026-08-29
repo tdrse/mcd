@@ -972,6 +972,9 @@ static void browse_load(const char *path)
         return;
     }
 
+    char old_dir[PATH_MAX];
+    snprintf(old_dir, sizeof(old_dir), "%s", browse_dir);
+
     list_clear(&browse_list);
     snprintf(browse_dir, sizeof(browse_dir), "%s", resolved);
 
@@ -1011,6 +1014,37 @@ static void browse_load(const char *path)
     }
 
     rebuild_browse();
+
+    if (old_dir[0] && browse_list.fn > 0) {
+        const char *rel = NULL;
+        size_t res_len = strlen(resolved);
+
+        if (strcmp(resolved, "/") == 0) {
+            if (old_dir[0] == '/' && old_dir[1] != '\0') {
+                rel = old_dir + 1;
+            }
+        } else if (strlen(old_dir) > res_len &&
+                   strncmp(old_dir, resolved, res_len) == 0 &&
+                   old_dir[res_len] == '/') {
+            rel = old_dir + res_len + 1;
+        }
+
+        if (rel && *rel) {
+            const char *slash = strchr(rel, '/');
+            size_t len = slash ? (size_t)(slash - rel) : strlen(rel);
+
+            for (size_t i = 0; i < browse_list.fn; i++) {
+                const char *item = browse_list.items[browse_list.filt[i]];
+
+                if (strlen(item) == len && strncmp(item, rel, len) == 0) {
+                    browse_list.sel = i;
+                    ensure_visible(&browse_list);
+                    break;
+                }
+            }
+        }
+    }
+
     set_status("");
 }
 
@@ -1287,7 +1321,6 @@ static int read_key(unsigned char *ch_out, MouseEvent *m)
     if (c == 9) return K_TAB;
     if (c == 3) return K_CTRL_C;
     if (c == 16) return K_CTRL_P;
-    
 
     if (c >= 32) {
         *ch_out = c;
@@ -1896,9 +1929,9 @@ int main(int argc, char **argv)
 
             if (l->fn > 0 && l->sel > 0 && list_height > 0) {
                 size_t step = (size_t)list_height;
- 
+
                 l->sel = (l->sel >= step) ? l->sel - step : 0;
- 
+
                 ensure_visible(l);
                 need_draw = 1;
             } else {
