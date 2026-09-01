@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
+// #define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1977,7 +1977,8 @@ int main(int argc, char **argv)
     sigaction(SIGWINCH, &sa, NULL);
 
     char old_status[MAX_STATUS];
-    time_t status_time_count = time(NULL);
+    struct timespec status_time_count;
+    clock_gettime(CLOCK_MONOTONIC, &status_time_count);
 
     draw_full();
 
@@ -2003,9 +2004,15 @@ int main(int argc, char **argv)
             continue;
         }
 
-        if (too_narrow) continue;
+        if (too_narrow && k != K_ESC && k != K_CTRL_C) continue;
 
-        if (status_msg[0] != '\0' && difftime(time(NULL), status_time_count) >= 2.0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        double elapsed = (now.tv_sec - status_time_count.tv_sec) +
+                         (now.tv_nsec - status_time_count.tv_nsec) * 1e-9;
+
+        if (status_msg[0] != '\0' && elapsed >= 2.0) {
             set_status("");
             apply_refresh();
         }
@@ -2156,7 +2163,7 @@ int main(int argc, char **argv)
             size_t len = strlen(query);
             if (len > 0) {
                 query_backspace();
-                refresh_flags |= RF_INPUT  | RF_STATUS | RF_LIST;
+                refresh_flags |= RF_INPUT | RF_STATUS | RF_LIST;
             }
             break;
         }
@@ -2168,7 +2175,7 @@ int main(int argc, char **argv)
                 query[len + 1] = '\0';
                 set_status("");
                 rebuild_all();
-                refresh_flags |= RF_INPUT  | RF_STATUS | RF_LIST;
+                refresh_flags |= RF_INPUT | RF_STATUS | RF_LIST;
             }
             break;
         }
@@ -2178,7 +2185,7 @@ int main(int argc, char **argv)
         }
 
         if (strcmp(status_msg, old_status) != 0) {
-            status_time_count = time(NULL);
+            clock_gettime(CLOCK_MONOTONIC, &status_time_count);
             refresh_flags |= RF_STATUS;
         }
 
