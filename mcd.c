@@ -29,6 +29,16 @@
 #define MAX_QUERY 256
 #define MAX_STATUS 160
 
+/* refresh flags */
+#define RF_TITLE    (1 << 0)
+#define RF_INPUT    (1 << 1)
+#define RF_STATUS   (1 << 2)
+#define RF_LIST     (1 << 3)
+#define RF_BUTTONS  (1 << 4)
+#define RF_HELP     (1 << 5)
+
+static int refresh_flags = 0;
+
 typedef struct {
     int button;
     int x;
@@ -112,6 +122,8 @@ static struct timespec last_click = {0, 0};
 static size_t last_click_index = (size_t)-1;
 static int last_click_mode = -1;
 
+static int too_narrow = 0;
+
 static volatile sig_atomic_t got_winch = 0;
 
 static void winch_handler(int sig)
@@ -120,9 +132,37 @@ static void winch_handler(int sig)
     got_winch = 1;
 }
 
+static volatile sig_atomic_t g_need_clear_all = 0;
+
+// debug function
+/*
+#include <stdarg.h>
+void debug_print(const char *format, ...) {
+    static FILE *pts = NULL;
+    if (pts == NULL) {
+        pts = fopen("/dev/pts/1", "w");
+        if (pts == NULL) return;
+        setvbuf(pts, NULL, _IONBF, 0);
+    }
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(pts, format, args);
+    va_end(args);
+}
+
+// debug macro
+#define log_info(fmt, ...)  debug_print("\033[1;32m[INFO]\033[0m " fmt "\n", ##__VA_ARGS__)
+#define log_warn(fmt, ...)  debug_print("\033[1;33m[WARN]\033[0m " fmt "\n", ##__VA_ARGS__)
+#define log_error(fmt, ...) debug_print("\033[1;31m[ERRO]\033[0m " fmt "\n", ##__VA_ARGS__)
+*/
+
 static void set_status(const char *s)
 {
-    snprintf(status_msg, sizeof(status_msg), "%s", s ? s : "");
+    if (strcmp(status_msg, s) != 0){
+        snprintf(status_msg, sizeof(status_msg), "%s", s ? s : "");
+        refresh_flags |= RF_STATUS;
+    }
 }
 
 static void set_status_errno(const char *action)
@@ -302,6 +342,7 @@ static void rebuild_all(void)
 static void query_clean(void)
 {
     query[0] = '\0';
+    refresh_flags |= RF_INPUT;
     rebuild_all();
 }
 
@@ -847,6 +888,8 @@ static void ensure_visible(List *l)
                         ? l->fn - list_height
                         : 0;
     }
+
+    set_status("");
 }
 
 static int wheel_scroll(int down)
@@ -877,6 +920,7 @@ static int wheel_scroll(int down)
     }
 
     ensure_visible(l);
+    refresh_flags |= RF_LIST;
     return 1;
 }
 
@@ -971,6 +1015,8 @@ static void browse_load(const char *path)
     if (!canonicalize_path(path, resolved, sizeof(resolved))) {
         return;
     }
+
+    refresh_flags |= RF_TITLE | RF_STATUS | RF_LIST;
 
     char old_dir[PATH_MAX];
     snprintf(old_dir, sizeof(old_dir), "%s", browse_dir);
@@ -1127,6 +1173,7 @@ static void browse_custom_selected(void)
     }
 
     mode = MODE_BROWSE;
+    refresh_flags |= RF_BUTTONS;
     query_clean();
     browse_load(resolved);
 }
@@ -1373,23 +1420,31 @@ static int handle_mouse(const MouseEvent *m)
             }
         }
 
+        refresh_flags |= RF_TITLE | RF_STATUS | RF_LIST;
         return 0;
     }
 
     if (in_button(&b_custom, m->x, m->y)) {
-        mode = MODE_CUSTOM;
+        if (mode != MODE_CUSTOM) {
+            mode = MODE_CUSTOM;
+            refresh_flags |= RF_TITLE | RF_STATUS | RF_LIST | RF_BUTTONS;
+        }
         set_status("");
         return 1;
     }
 
     if (in_button(&b_browse, m->x, m->y)) {
-        mode = MODE_BROWSE;
+        if (mode != MODE_BROWSE) {
+            mode = MODE_BROWSE;
+            refresh_flags |= RF_TITLE | RF_STATUS | RF_LIST | RF_BUTTONS;
+        }
         set_status("");
         return 1;
     }
 
     if (in_button(&b_parent, m->x, m->y)) {
         mode = MODE_BROWSE;
+        refresh_flags |= RF_BUTTONS;
         browse_go_parent();
         return 1;
     }
@@ -1427,6 +1482,8 @@ static int handle_mouse(const MouseEvent *m)
         double dt =
             (now.tv_sec - last_click.tv_sec) * 1000.0 +
             (now.tv_nsec - last_click.tv_nsec) / 1000000.0;
+
+        refresh_flags |= RF_LIST;
 
         if (idx == l->sel &&
             idx == last_click_index &&
@@ -1484,115 +1541,179 @@ static int draw_button(int y, int x, const char *label, int active)
     return x + (int)strlen(label) - 1;
 }
 
-static void draw(void)
+static void draw_title(void)
 {
-    static int last_rows = -1;
-    static int last_cols = -1;
+    const char *title = (mode == MODE_CUSTOM) ? "mcd - custom" : "mcd - browse";
+    fprintf(stderr, "\x1b[1;1H\x1b[1m");
+    print_clipped(title, cols - 1);
+    fputs("\x1b[0m", stderr);
+    fprintf(stderr, "\x1b[K");
+}
 
-    get_size();
+static void draw_input(void)
+{
+    fprintf(stderr, "\x1b[2;1H> ");
+    print_clipped(query, cols - 3);
+    fprintf(stderr, "\x1b[K");
+}
 
-    path_click_y = 0;
-    path_click_x1 = 0;
-    path_click_x2 = -1;
+static void draw_status(void)
+{
+    List *l = active_list();
+    char info[PATH_MAX + 128];
 
-    if (rows != last_rows || cols != last_cols) {
-        fputs("\x1b[H\x1b[2J", stderr);
-        last_rows = rows;
-        last_cols = cols;
-    } else {
-        fputs("\x1b[H", stderr);
-    }
+    static size_t last_fn = 0;
+    static size_t last_custom_n = 0;
+    static size_t last_browse_n = 0;
+    static int last_mode = -1;
+    static int last_cols = 0;
 
-    if (rows < 8 || cols < 50) {
-        fprintf(stderr, "\x1b[1;1H\x1b[2KTerminal too small.\r\n");
+    static char last_status_msg[sizeof(status_msg)] = {0};
+    static char last_browse_dir[PATH_MAX] = {0};
+
+    int state_changed =  g_need_clear_all || (l->fn != last_fn) ||
+                         (custom_list.n != last_custom_n) ||
+                         (browse_list.n != last_browse_n) ||
+                         (mode != last_mode) ||
+                         (cols != last_cols) ||
+                         (status_msg[0] != last_status_msg[0]) ||
+                         (strcmp(status_msg, last_status_msg) != 0) ||
+                         (strcmp(browse_dir, last_browse_dir) != 0);
+
+    if (!state_changed) {
         return;
     }
 
-    List *l = active_list();
+    last_fn = l->fn;
+    last_custom_n = custom_list.n;
+    last_browse_n = browse_list.n;
+    last_mode = mode;
+    last_cols = cols;
 
-    list_top = 4;
-    int bottom = rows - 3;
-    list_height = bottom - list_top + 1;
-    if (list_height < 1) list_height = 1;
-
-    ensure_visible(l);
-
-    const char *title =
-        (mode == MODE_CUSTOM) ? "mcd - custom" : "mcd - browse";
-
-    /* title */
-    fprintf(stderr, "\x1b[1;1H\x1b[2K\x1b[1m");
-    print_clipped(title, cols - 1);
-    fputs("\x1b[0m", stderr);
-
-    /* filter */
-    fprintf(stderr, "\x1b[2;1H\x1b[2K> ");
-    print_clipped(query, cols - 3);
-
-    /* info / path */
-    char info[PATH_MAX + 128];
+    snprintf(last_status_msg, sizeof(last_status_msg), "%s", status_msg);
+    snprintf(last_browse_dir, sizeof(last_browse_dir), "%s", browse_dir);
 
     if (status_msg[0]) {
         snprintf(info, sizeof(info), "Status: %s", status_msg);
-        fprintf(stderr, "\x1b[3;1H\x1b[2K");
+        fprintf(stderr, "\x1b[3;1H");
         print_clipped(info, cols - 1);
+        fprintf(stderr, "\x1b[K");
     } else if (mode == MODE_CUSTOM) {
         snprintf(info, sizeof(info), "Custom %zu/%zu | Tab switch view",
                  l->fn, custom_list.n);
-        fprintf(stderr, "\x1b[3;1H\x1b[2K");
+        fprintf(stderr, "\x1b[3;1H");
         print_clipped(info, cols - 1);
+        fprintf(stderr, "\x1b[K");
     } else {
         char prefix[64];
-
         int plen = snprintf(prefix, sizeof(prefix), "Browse %zu/%zu | ",
                             l->fn, browse_list.n);
-
         if (plen < 0) plen = 0;
 
-        fprintf(stderr, "\x1b[3;1H\x1b[2K%s", prefix);
+        fprintf(stderr, "\x1b[3;1H%s", prefix);
 
         int max_path_w = cols - plen - 1;
 
         if (max_path_w > 0) {
             path_click_y = 3;
             path_click_x1 = plen + 1;
-
             int dispw = visual_width_clipped(browse_dir, max_path_w);
             path_click_x2 = path_click_x1 + dispw - 1;
-
             print_clipped(browse_dir, max_path_w);
+        }
+
+        fprintf(stderr, "\x1b[K");
+    }
+}
+
+static void draw_list(void)
+{
+    List *l = active_list();
+
+    static size_t last_scroll = 0;
+    static size_t last_sel = 0;
+    static size_t last_fn = 0;
+    static int last_cols = 0;
+    static int last_rows = 0;
+    static int last_sel_item_idx = -1;
+    static List *last_active_list_ptr = NULL;
+
+    int current_sel_idx = (l->fn > 0 && l->sel < l->fn) ? l->filt[l->sel] : -1;
+
+    int state_changed = g_need_clear_all ||
+                      (l != last_active_list_ptr) ||
+                      (l->scroll != last_scroll)  ||
+                      (l->sel != last_sel)        ||
+                      (l->fn != last_fn)          ||
+                      (cols != last_cols)         ||
+                      (rows != last_rows)         ||
+                      (current_sel_idx != last_sel_item_idx);
+
+    if (!state_changed) {
+        return;
+    }
+
+    int full_redraw = g_need_clear_all ||
+                           (l != last_active_list_ptr) ||
+                           (l->scroll != last_scroll)  ||
+                           (l->fn != last_fn)          ||
+                           (cols != last_cols)         ||
+                           (rows != last_rows);
+
+    if (full_redraw) {
+        size_t end = l->scroll + (size_t)list_height;
+        if (end > l->fn) end = l->fn;
+
+        int drawn = 0;
+        for (size_t i = l->scroll; i < end; i++, drawn++) {
+            int y = list_top + drawn;
+            int selected = (i == l->sel);
+
+            fprintf(stderr, "\x1b[%d;1H", y);
+            if (selected) fputs("\x1b[7m", stderr);
+            fputc(selected ? '>' : ' ', stderr);
+            fputc(' ', stderr);
+            print_clipped(l->items[l->filt[i]], cols - 3);
+            if (selected) fputs("\x1b[0m", stderr);
+            fprintf(stderr, "\x1b[K");
+        }
+
+        int bottom = rows - 3;
+        for (int y = list_top + drawn; y <= bottom; y++) {
+            fprintf(stderr, "\x1b[%d;1H\x1b[2K", y);
+        }
+    }
+    else {
+        size_t old_idx = last_sel;
+        if (old_idx < l->fn && old_idx >= l->scroll && old_idx < l->scroll + (size_t)list_height) {
+            int y = list_top + (int)(old_idx - l->scroll);
+            fprintf(stderr, "\x1b[%d;1H  ", y);
+            print_clipped(l->items[l->filt[old_idx]], cols - 3);
+            fprintf(stderr, "\x1b[K");
+        }
+
+        size_t new_idx = l->sel;
+        if (new_idx < l->fn && new_idx >= l->scroll && new_idx < l->scroll + (size_t)list_height) {
+            int y = list_top + (int)(new_idx - l->scroll);
+            fprintf(stderr, "\x1b[%d;1H\x1b[7m> ", y);
+            print_clipped(l->items[l->filt[new_idx]], cols - 3);
+            fprintf(stderr, "\x1b[0m\x1b[K");
         }
     }
 
-    /* list */
-    size_t end = l->scroll + (size_t)list_height;
-    if (end > l->fn) end = l->fn;
+    last_active_list_ptr = l;
+    last_scroll = l->scroll;
+    last_sel = l->sel;
+    last_fn = l->fn;
+    last_cols = cols;
+    last_rows = rows;
+    last_sel_item_idx = current_sel_idx;
+}
 
-    int drawn = 0;
-
-    for (size_t i = l->scroll; i < end; i++, drawn++) {
-        int y = list_top + drawn;
-        int selected = (i == l->sel);
-
-        fprintf(stderr, "\x1b[%d;1H\x1b[2K", y);
-
-        if (selected) fputs("\x1b[7m", stderr);
-
-        fputc(selected ? '>' : ' ', stderr);
-        fputc(' ', stderr);
-
-        print_clipped(l->items[l->filt[i]], cols - 3);
-
-        if (selected) fputs("\x1b[0m", stderr);
-    }
-
-    for (int y = list_top + drawn; y <= bottom; y++) {
-        fprintf(stderr, "\x1b[%d;1H\x1b[2K", y);
-    }
-
-    /* buttons */
+static void draw_buttons(void)
+{
     btn_y = rows - 2;
-    fprintf(stderr, "\x1b[%d;1H\x1b[2K", btn_y);
+    fprintf(stderr, "\x1b[%d;1H", btn_y);
 
     int x = 2;
 
@@ -1619,16 +1740,93 @@ static void draw(void)
     b_quit.x1 = x;
     b_quit.x2 = draw_button(btn_y, x, "[X]", 0);
 
-    /* help */
+    fprintf(stderr, "\x1b[K");
+}
+
+static void draw_help(void)
+{
     const char *help =
         "Tab view | Left parent | Right enter | Enter choose | Ctrl+P mode | Esc quit";
-
-    fprintf(stderr, "\x1b[%d;1H\x1b[2K", rows);
+    fprintf(stderr, "\x1b[%d;1H", rows);
     print_clipped(help, cols - 1);
+    fprintf(stderr, "\x1b[K");
+}
 
+static void draw_cursor(void)
+{
     int query_display_width = visual_width_clipped(query, cols - 3);
     int cursor_x = 3 + query_display_width;
     fprintf(stderr, "\x1b[2;%dH", cursor_x);
+}
+
+static void apply_refresh(void)
+{
+    if (refresh_flags == 0) {
+        draw_cursor();
+        fflush(stderr);
+        return;
+    }
+
+    if (refresh_flags & RF_TITLE) draw_title();
+    if (refresh_flags & RF_INPUT) draw_input();
+    if (refresh_flags & RF_STATUS) draw_status();
+
+    if (refresh_flags & RF_LIST) draw_list();
+
+    if (refresh_flags & RF_BUTTONS) draw_buttons();
+    if (refresh_flags & RF_HELP) draw_help();
+
+    draw_cursor();
+    fflush(stderr);
+
+    g_need_clear_all = 0;
+
+    refresh_flags = 0;
+}
+
+static void draw_full(void)
+{
+    static int last_rows = -1;
+    static int last_cols = -1;
+
+    get_size();
+
+    path_click_y = 0;
+    path_click_x1 = 0;
+    path_click_x2 = -1;
+
+    if (rows != last_rows || cols != last_cols) {
+        fputs("\x1b[H\x1b[2J", stderr);
+        g_need_clear_all = 1;
+        last_rows = rows;
+        last_cols = cols;
+    } else {
+        fputs("\x1b[H", stderr);
+    }
+
+    if (rows < 8 || cols < 50) {
+        fprintf(stderr, "\x1b[1;1H\x1b[2KTerminal too small.\r\n");
+        too_narrow = 1;
+        return;
+    } else if (too_narrow) {
+        too_narrow = 0;
+    }
+
+    list_top = 4;
+    int bottom = rows - 3;
+    list_height = bottom - list_top + 1;
+    if (list_height < 1) list_height = 1;
+
+    List *l = active_list();
+    ensure_visible(l);
+
+    draw_title();
+    draw_input();
+    draw_status();
+    draw_list();
+    draw_buttons();
+    draw_help();
+    draw_cursor();
 
     fflush(stderr);
 }
@@ -1694,7 +1892,7 @@ static void init_custom(int have_arg_dirs)
 
 static void usage(const char *prog)
 {
-    printf("mcd: mouse TUI quick cd tool v3.5.2\n\n");
+    printf("mcd: mouse-driven TUI quick cd tool v3.6\n\n");
     printf("Usage:\n");
     printf("  %s                 use ~/.mcd_dirs / MCD_FILE / MCD_PATHS / defaults\n", prog);
     printf("  %s [dirs...]       use only given custom dirs\n", prog);
@@ -1778,12 +1976,16 @@ int main(int argc, char **argv)
     sa.sa_handler = winch_handler;
     sigaction(SIGWINCH, &sa, NULL);
 
-    draw();
+    char old_status[MAX_STATUS];
+    time_t status_time_count = time(NULL);
+
+    draw_full();
 
     while (!done) {
         if (got_winch) {
             got_winch = 0;
-            draw();
+            // flush_stdin();
+            draw_full();
             continue;
         }
 
@@ -1797,206 +1999,191 @@ int main(int argc, char **argv)
         if (got_winch) {
             got_winch = 0;
             flush_stdin();
-            draw();
+            draw_full();
             continue;
         }
 
-        if (k == K_NONE) continue;
+        if (too_narrow) continue;
 
-        int need_draw = 1;
-        set_status("");
+        if (status_msg[0] != '\0' && difftime(time(NULL), status_time_count) >= 2.0) {
+            set_status("");
+            apply_refresh();
+        }
+
+        if (k == K_NONE) continue;
+        if (k == K_MOUSE && !m.press) continue;
+
+        snprintf(old_status, sizeof(old_status), "%s", status_msg);
+
+        refresh_flags = 0;
 
         switch (k) {
-        case K_MOUSE:
-            need_draw = handle_mouse(&m);
-            break;
+        case K_MOUSE: {
+            handle_mouse(&m);
 
-        case K_ENTER:
+            if (status_msg[0]) {
+                refresh_flags |= RF_STATUS;
+            }
+            break;
+        }
+
+        case K_ENTER: {
             if (mode == MODE_CUSTOM) {
                 confirm_custom_selected();
             } else {
                 confirm_browse_selected();
             }
+            if (!done && status_msg[0]) {
+                refresh_flags |= RF_STATUS;
+            }
             break;
+        }
 
         case K_ESC:
         case K_CTRL_C:
             done = 1;
             cancelled = 1;
-            need_draw = 0;
             break;
 
         case K_UP: {
             List *l = active_list();
-
-            if (l->fn > 0 && l->sel > 0) {
+            if (l->sel > 0) {
                 l->sel--;
                 ensure_visible(l);
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_LIST;
             }
-
             break;
         }
 
         case K_DOWN: {
             List *l = active_list();
-
             if (l->fn > 0 && l->sel + 1 < l->fn) {
                 l->sel++;
                 ensure_visible(l);
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_LIST;
             }
-
             break;
         }
 
-        case K_LEFT:
+        case K_LEFT: {
             if (mode == MODE_BROWSE) {
                 browse_go_parent();
             } else {
                 mode = MODE_BROWSE;
                 query_clean();
                 set_status("");
+                refresh_flags |= RF_TITLE | RF_STATUS | RF_LIST | RF_BUTTONS;
             }
             break;
+        }
 
-        case K_RIGHT:
+        case K_RIGHT: {
             if (mode == MODE_CUSTOM) {
                 browse_custom_selected();
             } else {
                 browse_enter_selected();
             }
             break;
+        }
 
-        case K_TAB:
+        case K_TAB: {
             mode = (mode == MODE_CUSTOM) ? MODE_BROWSE : MODE_CUSTOM;
             set_status("");
+            refresh_flags |= RF_TITLE | RF_STATUS | RF_LIST | RF_BUTTONS;
             break;
+        }
 
         case K_CTRL_P: {
             physical_mode = !physical_mode;
 
-            if (browse_dir[0]) {
-                char tmp[PATH_MAX];
-
-                snprintf(tmp, sizeof(tmp), "%s", browse_dir);
-                browse_load(tmp);
-            }
-
             if (physical_mode) {
+                char real[PATH_MAX];
+                if (realpath(browse_dir, real)) {
+                    snprintf(browse_dir, sizeof(browse_dir), "%s", real);
+                }
                 set_status("Mode: physical (-P)");
             } else {
+                strip_trailing_slashes(browse_dir);
                 set_status("Mode: logical");
             }
-
             break;
         }
 
         case K_HOME: {
             List *l = active_list();
-
             if (l->fn > 0 && l->sel > 0) {
                 l->sel = 0;
                 ensure_visible(l);
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_LIST;
             }
-
             break;
         }
 
         case K_END: {
             List *l = active_list();
-
             if (l->fn > 0 && l->sel + 1 < l->fn) {
                 l->sel = l->fn - 1;
                 ensure_visible(l);
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_LIST;
             }
-
             break;
         }
 
         case K_PGUP: {
             List *l = active_list();
-
             if (l->fn > 0 && l->sel > 0 && list_height > 0) {
                 size_t step = (size_t)list_height;
-
                 l->sel = (l->sel >= step) ? l->sel - step : 0;
-
                 ensure_visible(l);
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_LIST;
             }
-
             break;
         }
 
         case K_PGDN: {
             List *l = active_list();
-
             if (l->fn > 0 && l->sel + 1 < l->fn && list_height > 0) {
                 size_t step = (size_t)list_height;
                 size_t max_idx = l->fn - 1;
-
                 l->sel = (l->sel + step < max_idx) ? l->sel + step : max_idx;
-
                 ensure_visible(l);
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_LIST;
             }
-
             break;
         }
 
         case K_BACKSPACE: {
             size_t len = strlen(query);
-
             if (len > 0) {
                 query_backspace();
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_INPUT  | RF_STATUS | RF_LIST;
             }
-
             break;
         }
 
         case K_CHAR: {
             size_t len = strlen(query);
-
             if (len < MAX_QUERY - 1) {
                 query[len] = (char)ch;
                 query[len + 1] = '\0';
-
                 set_status("");
                 rebuild_all();
-
-                need_draw = 1;
-            } else {
-                need_draw = 0;
+                refresh_flags |= RF_INPUT  | RF_STATUS | RF_LIST;
             }
-
             break;
         }
 
         default:
-            need_draw = 0;
             break;
         }
 
-        if (!done && need_draw) {
-            draw();
+        if (strcmp(status_msg, old_status) != 0) {
+            status_time_count = time(NULL);
+            refresh_flags |= RF_STATUS;
+        }
+
+        if (!done) {
+            apply_refresh();
         }
     }
 
