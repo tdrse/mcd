@@ -77,6 +77,7 @@ typedef struct {
 
 typedef struct {
     char **items;
+    int *is_link;
     size_t n, cap;
 
     int *filt;
@@ -97,6 +98,7 @@ static int mode = MODE_CUSTOM;
 static List custom_list;
 static List browse_list;
 
+static char cwd_path[PATH_MAX] = "";
 static char browse_dir[PATH_MAX] = "";
 static char query[MAX_QUERY] = "";
 
@@ -284,18 +286,94 @@ static void filt_add(List *l, size_t idx)
     l->filt[l->fn++] = (int)idx;
 }
 
-static void list_rebuild(List *l)
+static void path_join(char *out, size_t outsz, const char *base, const char *name)
 {
-    l->fn = 0;
+    if (name[0] == '/') {
+        snprintf(out, outsz, "%s", name);
+    } else if (!base || !*base || strcmp(base, "/") == 0) {
+        snprintf(out, outsz, "/%s", name);
+    } else {
+        snprintf(out, outsz, "%s/%s", base, name);
+    }
+}
+
+static void strip_trailing_slashes(char *s)
+{
+    if (!s) return;
+
+    size_t len = strlen(s);
+
+    while (len > 1 && s[len - 1] == '/') {
+        s[--len] = '\0';
+    }
+}
+
+static void path_clean_slashes(char *path) {
+    if (!path || !*path) return;
+
+    int src = 0;
+    int dst = 0;
+
+    while (path[src] != '\0') {
+        path[dst] = path[src];
+
+        if (path[src] == '/') {
+            while (path[src] == '/') {
+                src++;
+            }
+        } else {
+            src++;
+        }
+        dst++;
+    }
+    path[dst] = '\0';
+}
+
+static void list_update_link(List *l)
+{
+    if (l->n == 0) {
+        if (l->is_link) { free(l->is_link); l->is_link = NULL; }
+        return;
+    }
+
+    int *tmp = realloc(l->is_link, l->n * sizeof(int));
+    if (!tmp) return;
+    l->is_link = tmp;
 
     for (size_t i = 0; i < l->n; i++) {
-        if (ci_contains(l->items[i], query)) {
-            filt_add(l, i);
+        const char *name = l->items[i];
+
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            l->is_link[i] = 0;
+            continue;
+        }
+
+        char full[PATH_MAX];
+        if (l == &browse_list) {
+            path_join(full, sizeof(full), browse_dir, name);
+        } else {
+            path_join(full, sizeof(full), cwd_path, name);
+        }
+
+        struct stat st;
+        l->is_link[i] = (lstat(full, &st) == 0 && S_ISLNK(st.st_mode));
+    }
+}
+
+static void rebuild_custom(void)
+{
+    custom_list.fn = 0;
+
+    for (size_t i = 0; i < custom_list.n; i++) {
+        if (ci_contains(custom_list.items[i], query)) {
+            filt_add(&custom_list, i);
         }
     }
 
-    l->sel = 0;
-    l->scroll = 0;
+    custom_list.sel = 0;
+    custom_list.scroll = 0;
+
+    list_update_link(&custom_list);
 }
 
 static void rebuild_browse(void)
@@ -331,11 +409,13 @@ static void rebuild_browse(void)
 
     browse_list.sel = 0;
     browse_list.scroll = 0;
+
+    list_update_link(&browse_list);
 }
 
 static void rebuild_all(void)
 {
-    list_rebuild(&custom_list);
+    rebuild_custom();
     rebuild_browse();
 }
 
@@ -345,6 +425,45 @@ static void query_clean(void)
     refresh_flags |= RF_INPUT;
     rebuild_all();
 }
+
+static void normalize_path(char *out) {
+    if (!out || *out == '\0') return;
+
+    char *r = out;
+    char *w = out;
+
+    while (*r != '\0') {
+        if (*r == '/') {
+            *w++ = *r++;
+            while (*r == '/') r++;
+            continue;
+        }
+
+        if (*r == '.' && (r == out || *(r - 1) == '/')) {
+            if (*(r + 1) == '/' || *(r + 1) == '\0') {
+                r += 1;
+                if (*r == '/') r++;
+                continue;
+            }
+            if (*(r + 1) == '.' && (*(r + 2) == '/' || *(r + 2) == '\0')) {
+                r += 2;
+                if (*r == '/') r++;
+
+                if (w > out + 1) {
+                    w--;
+                    while (w > out && *(w - 1) != '/') w--;
+                }
+                continue;
+            }
+        }
+        *w++ = *r++;
+    }
+
+    if (w > out + 1 && *(w - 1) == '/') w--;
+    if (w == out) *w++ = '/';
+    *w = '\0';
+}
+
 
 static void add_custom_path(const char *s)
 {
@@ -364,12 +483,11 @@ static void add_custom_path(const char *s)
         snprintf(buf, sizeof(buf), "%s", s);
     }
 
-    size_t len = strlen(buf);
-    while (len > 1 && buf[len - 1] == '/') {
-        buf[--len] = '\0';
-    }
+    path_clean_slashes(buf);
+    strip_trailing_slashes(buf);
 
     if (buf[0] == '\0') return;
+    // if (!*buf) return;
 
     for (size_t i = 0; i < custom_list.n; i++) {
         if (strcmp(custom_list.items[i], buf) == 0) {
@@ -415,17 +533,6 @@ static int path_is_dir(const char *path)
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static void strip_trailing_slashes(char *s)
-{
-    if (!s) return;
-
-    size_t len = strlen(s);
-
-    while (len > 1 && s[len - 1] == '/') {
-        s[--len] = '\0';
-    }
-}
-
 static int canonicalize_path(const char *in, char *out, size_t outsz)
 {
     if (!in || !*in || !out || outsz == 0) {
@@ -462,6 +569,7 @@ static int canonicalize_path(const char *in, char *out, size_t outsz)
     }
 
     strip_trailing_slashes(out);
+    normalize_path(out);
 
     if (!out[0]) {
         set_status("Empty path");
@@ -510,20 +618,6 @@ static void get_initial_cwd(char *out, size_t outsz)
     }
 
     snprintf(out, outsz, "/");
-}
-
-static void path_join(char *out, size_t outsz, const char *base, const char *name)
-{
-    if (!base || !*base) {
-        snprintf(out, outsz, "/%s", name);
-        return;
-    }
-
-    if (strcmp(base, "/") == 0) {
-        snprintf(out, outsz, "/%s", name);
-    } else {
-        snprintf(out, outsz, "%s/%s", base, name);
-    }
 }
 
 static int path_parent(char *out, size_t outsz, const char *path)
@@ -928,7 +1022,10 @@ static void confirm_path(const char *path)
 {
     char resolved[PATH_MAX];
 
-    if (!canonicalize_path(path, resolved, sizeof(resolved))) {
+    char full[PATH_MAX];
+    path_join(full, sizeof(full), cwd_path, path);
+
+    if (!canonicalize_path(full, resolved, sizeof(resolved))) {
         return;
     }
 
@@ -1168,7 +1265,10 @@ static void browse_custom_selected(void)
     const char *path = custom_list.items[custom_list.filt[custom_list.sel]];
     char resolved[PATH_MAX];
 
-    if (!canonicalize_path(path, resolved, sizeof(resolved))) {
+    char full[PATH_MAX];
+    path_join(full, sizeof(full), cwd_path, path);
+
+    if (!canonicalize_path(full, resolved, sizeof(resolved))) {
         return;
     }
 
@@ -1669,10 +1769,18 @@ static void draw_list(void)
             int y = list_top + drawn;
             int selected = (i == l->sel);
 
+            int is_link = (l->is_link != NULL) ? l->is_link[l->filt[i]] : 0;
+
             fprintf(stderr, "\x1b[%d;1H", y);
             if (selected) fputs("\x1b[7m", stderr);
             fputc(selected ? '>' : ' ', stderr);
-            fputc(' ', stderr);
+
+            if (is_link) {
+                fputc('^', stderr);
+            } else {
+                fputc(' ', stderr);
+            }
+
             print_clipped(l->items[l->filt[i]], cols - 3);
             if (selected) fputs("\x1b[0m", stderr);
             fprintf(stderr, "\x1b[K");
@@ -1682,12 +1790,21 @@ static void draw_list(void)
         for (int y = list_top + drawn; y <= bottom; y++) {
             fprintf(stderr, "\x1b[%d;1H\x1b[2K", y);
         }
-    }
-    else {
+    } else {
         size_t old_idx = last_sel;
         if (old_idx < l->fn && old_idx >= l->scroll && old_idx < l->scroll + (size_t)list_height) {
             int y = list_top + (int)(old_idx - l->scroll);
-            fprintf(stderr, "\x1b[%d;1H  ", y);
+
+            int is_link = (l->is_link != NULL) ? l->is_link[l->filt[old_idx]] : 0;
+
+            fprintf(stderr, "\x1b[%d;1H ", y);
+
+            if (is_link) {
+                fputc('^', stderr);
+            } else {
+                fputc(' ', stderr);
+            }
+
             print_clipped(l->items[l->filt[old_idx]], cols - 3);
             fprintf(stderr, "\x1b[K");
         }
@@ -1695,7 +1812,17 @@ static void draw_list(void)
         size_t new_idx = l->sel;
         if (new_idx < l->fn && new_idx >= l->scroll && new_idx < l->scroll + (size_t)list_height) {
             int y = list_top + (int)(new_idx - l->scroll);
-            fprintf(stderr, "\x1b[%d;1H\x1b[7m> ", y);
+
+            int is_link = (l->is_link != NULL) ? l->is_link[l->filt[new_idx]] : 0;
+
+            fprintf(stderr, "\x1b[%d;1H\x1b[7m>", y);
+
+            if (is_link) {
+                fputc('^', stderr);
+            } else {
+                fputc(' ', stderr);
+            }
+
             print_clipped(l->items[l->filt[new_idx]], cols - 3);
             fprintf(stderr, "\x1b[0m\x1b[K");
         }
@@ -1835,10 +1962,7 @@ static void init_custom(int have_arg_dirs)
 {
     if (have_arg_dirs) return;
 
-    char tmp[PATH_MAX];
-
-    get_initial_cwd(tmp, sizeof(tmp));
-    add_custom_path(tmp);
+    add_custom_path(cwd_path);
 
     int had_extra = 0;
 
@@ -1892,7 +2016,7 @@ static void init_custom(int have_arg_dirs)
 
 static void usage(const char *prog)
 {
-    printf("mcd: mouse-driven TUI quick cd tool v3.6\n\n");
+    printf("mcd: mouse-driven TUI quick cd tool v3.6.1\n\n");
     printf("Usage:\n");
     printf("  %s                 use ~/.mcd_dirs / MCD_FILE / MCD_PATHS / defaults\n", prog);
     printf("  %s [dirs...]       use only given custom dirs\n", prog);
@@ -1934,14 +2058,12 @@ int main(int argc, char **argv)
         }
     }
 
+    get_initial_cwd(cwd_path, sizeof(cwd_path));
+
     init_custom(have_arg_dirs);
+    browse_load(cwd_path);
 
-    char cwd[PATH_MAX];
-
-    get_initial_cwd(cwd, sizeof(cwd));
-    browse_load(cwd);
-
-    list_rebuild(&custom_list);
+    rebuild_custom();
 
     if (custom_list.n == 0) {
         mode = MODE_BROWSE;
