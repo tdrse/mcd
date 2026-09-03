@@ -157,6 +157,15 @@ void debug_print(const char *format, ...) {
 #define log_info(fmt, ...)  debug_print("\033[1;32m[INFO]\033[0m " fmt "\n", ##__VA_ARGS__)
 #define log_warn(fmt, ...)  debug_print("\033[1;33m[WARN]\033[0m " fmt "\n", ##__VA_ARGS__)
 #define log_error(fmt, ...) debug_print("\033[1;31m[ERRO]\033[0m " fmt "\n", ##__VA_ARGS__)
+
+static inline long long time_ns_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+#define PRINT_DURATION_NS(label, start_ns, end_ns) \
+    debug_print("%s: %lld ns (%.3f ms)\n", label, (end_ns - start_ns), (end_ns - start_ns) / 1000000.0)
 */
 
 static void set_status(const char *s)
@@ -463,7 +472,6 @@ static void normalize_path(char *out) {
     if (w == out) *w++ = '/';
     *w = '\0';
 }
-
 
 static void add_custom_path(const char *s)
 {
@@ -1138,15 +1146,16 @@ static void browse_load(const char *path)
     struct dirent *e;
 
     while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
-            continue;
-        }
+        if (e->d_name[0] == '.' && (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
 
-        char full[PATH_MAX];
-        path_join(full, sizeof(full), resolved, e->d_name);
-
-        if (path_is_dir(full)) {
+        if (e->d_type == DT_DIR) {
             list_add(&browse_list, e->d_name);
+        } else if (e->d_type == DT_LNK || e->d_type == DT_UNKNOWN) {
+            char full[PATH_MAX];
+            path_join(full, sizeof(full), resolved, e->d_name);
+            if (path_is_dir(full)) {
+                list_add(&browse_list, e->d_name);
+            }
         }
     }
 
@@ -1671,14 +1680,14 @@ static void draw_status(void)
     static char last_status_msg[sizeof(status_msg)] = {0};
     static char last_browse_dir[PATH_MAX] = {0};
 
-    int state_changed =  g_need_clear_all || (l->fn != last_fn) ||
-                         (custom_list.n != last_custom_n) ||
-                         (browse_list.n != last_browse_n) ||
-                         (mode != last_mode) ||
-                         (cols != last_cols) ||
-                         (status_msg[0] != last_status_msg[0]) ||
-                         (strcmp(status_msg, last_status_msg) != 0) ||
-                         (strcmp(browse_dir, last_browse_dir) != 0);
+    int state_changed = g_need_clear_all || (l->fn != last_fn) ||
+                        (custom_list.n != last_custom_n) ||
+                        (browse_list.n != last_browse_n) ||
+                        (mode != last_mode) ||
+                        (cols != last_cols) ||
+                        (status_msg[0] != last_status_msg[0]) ||
+                        (strcmp(status_msg, last_status_msg) != 0) ||
+                        (strcmp(browse_dir, last_browse_dir) != 0);
 
     if (!state_changed) {
         return;
@@ -1737,28 +1746,31 @@ static void draw_list(void)
     static int last_rows = 0;
     static int last_sel_item_idx = -1;
     static List *last_active_list_ptr = NULL;
+    static char last_browse_dir[PATH_MAX] = {0};
 
     int current_sel_idx = (l->fn > 0 && l->sel < l->fn) ? l->filt[l->sel] : -1;
 
     int state_changed = g_need_clear_all ||
-                      (l != last_active_list_ptr) ||
-                      (l->scroll != last_scroll)  ||
-                      (l->sel != last_sel)        ||
-                      (l->fn != last_fn)          ||
-                      (cols != last_cols)         ||
-                      (rows != last_rows)         ||
-                      (current_sel_idx != last_sel_item_idx);
+                    (l != last_active_list_ptr) ||
+                    (l->scroll != last_scroll) ||
+                    (l->sel != last_sel) ||
+                    (l->fn != last_fn) ||
+                    (cols != last_cols) ||
+                    (rows != last_rows) ||
+                    (current_sel_idx != last_sel_item_idx) ||
+                    (strcmp(browse_dir, last_browse_dir) != 0);
 
     if (!state_changed) {
         return;
     }
 
     int full_redraw = g_need_clear_all ||
-                           (l != last_active_list_ptr) ||
-                           (l->scroll != last_scroll)  ||
-                           (l->fn != last_fn)          ||
-                           (cols != last_cols)         ||
-                           (rows != last_rows);
+                    (l != last_active_list_ptr) ||
+                    (l->scroll != last_scroll) ||
+                    (l->fn != last_fn) ||
+                    (cols != last_cols) ||
+                    (rows != last_rows) ||
+                    (strcmp(browse_dir, last_browse_dir) != 0);
 
     if (full_redraw) {
         size_t end = l->scroll + (size_t)list_height;
@@ -1835,6 +1847,7 @@ static void draw_list(void)
     last_cols = cols;
     last_rows = rows;
     last_sel_item_idx = current_sel_idx;
+    snprintf(last_browse_dir, sizeof(last_browse_dir), "%s", browse_dir);
 }
 
 static void draw_buttons(void)
