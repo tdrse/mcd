@@ -60,10 +60,12 @@ enum {
     K_MOUSE,
     K_CTRL_C,
     K_CTRL_P,
+    K_CTRL_Q,
     K_HOME,
     K_END,
     K_PGUP,
-    K_PGDN
+    K_PGDN,
+    K_CTRL_R
 };
 
 enum {
@@ -187,37 +189,64 @@ static void set_status_errno(const char *action)
 static void leave_ui(void)
 {
     if (ui_active) {
+        tcflush(STDIN_FILENO, TCIFLUSH);
+
         fputs("\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[6n", stderr);
         fflush(stderr);
         ui_active = 0;
 
-        struct timeval timeout;
-        fd_set fds;
-        char sync_buf;
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        long long start_ms = (long long)t0.tv_sec * 1000 + t0.tv_nsec / 1000000;
 
-        while (1) {
+        int stage = 0;
+        int elapsed_ms = 0;
+
+        while (elapsed_ms < 100) {
+            struct timespec tn;
+            clock_gettime(CLOCK_MONOTONIC, &tn);
+            long long now_ms = (long long)tn.tv_sec * 1000 + tn.tv_nsec / 1000000;
+            elapsed_ms = (int)(now_ms - start_ms);
+
+            fd_set fds;
             FD_ZERO(&fds);
             FD_SET(STDIN_FILENO, &fds);
 
-            timeout.tv_sec = 0;
-            timeout.tv_usec = 50000;
+            struct timeval timeout;
+            timeout.tv_sec  = 0;
+            timeout.tv_usec = 10000;
 
             int ret = select(STDIN_FILENO + 1, &fds, NULL, NULL, &timeout);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (ret == 0) continue;
 
-            if (ret > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
-                if (read(STDIN_FILENO, &sync_buf, 1) > 0) {
-                    if (sync_buf == 'R') {
-                        break;
-                    }
-                }
-            } else {
+            char c;
+            ssize_t n = read(STDIN_FILENO, &c, 1);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                break;
+            }
+
+            switch (stage) {
+            case 0:
+                if (c == '\x1b') stage = 1;
+                break;
+            case 1:
+                stage = (c == '[') ? 2 : 0;
+                break;
+            case 2:
+                if (c == 'R') goto done;
+                if (c >= 0x40 && c <= 0x7E) stage = 0;
                 break;
             }
         }
+        done:;
     }
 
     if (raw_enabled) {
-        tcflush(STDIN_FILENO, TCIFLUSH);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_enabled = 0;
     }
@@ -428,7 +457,7 @@ static void rebuild_all(void)
     rebuild_browse();
 }
 
-static void query_clean(void)
+static void query_clear(void)
 {
     query[0] = '\0';
     refresh_flags |= RF_INPUT;
@@ -846,7 +875,7 @@ static void compose_child_path(char *out, size_t outsz, const char *base, const 
 
 static int path_target_at_click(const char *path, int cell, char *out, size_t outsz)
 {
-    if (!path || !*path || cell < 0 || !out || outsz == 0) {
+    if (status_msg[0] != '\0' || !path || !*path || cell < 0 || !out || outsz == 0) {
         return 0;
     }
 
@@ -1260,7 +1289,7 @@ static void browse_enter_selected(void)
     }
 
     /* include .. */
-    query_clean();
+    query_clear();
     browse_load(full);
 }
 
@@ -1283,7 +1312,7 @@ static void browse_custom_selected(void)
 
     mode = MODE_BROWSE;
     refresh_flags |= RF_BUTTONS;
-    query_clean();
+    query_clear();
     browse_load(resolved);
 }
 
@@ -1294,6 +1323,7 @@ static int enable_raw(void)
     }
 
     struct termios raw = orig_termios;
+    raw.c_iflag &= ~(IXON | IXOFF | IXANY);
     raw.c_lflag &= ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
@@ -1477,6 +1507,8 @@ static int read_key(unsigned char *ch_out, MouseEvent *m)
     if (c == 9) return K_TAB;
     if (c == 3) return K_CTRL_C;
     if (c == 16) return K_CTRL_P;
+    if (c == 17) return K_CTRL_Q;
+    if (c == 18) return K_CTRL_R;
 
     if (c >= 32) {
         *ch_out = c;
@@ -2029,7 +2061,7 @@ static void init_custom(int have_arg_dirs)
 
 static void usage(const char *prog)
 {
-    printf("mcd: mouse-driven TUI quick cd tool v3.6.1\n\n");
+    printf("mcd: mouse-driven TUI quick cd tool v3.6.2\n\n");
     printf("Usage:\n");
     printf("  %s                 use ~/.mcd_dirs / MCD_FILE / MCD_PATHS / defaults\n", prog);
     printf("  %s [dirs...]       use only given custom dirs\n", prog);
@@ -2044,6 +2076,7 @@ static void usage(const char *prog)
     printf("  Ctrl+P  change physical / logical mode\n");
     printf("  Enter   choose path\n");
     printf("  Esc     quit\n");
+    printf("  ...\n");
 }
 
 int main(int argc, char **argv)
@@ -2183,6 +2216,7 @@ int main(int argc, char **argv)
 
         case K_ESC:
         case K_CTRL_C:
+        case K_CTRL_Q:
             done = 1;
             cancelled = 1;
             break;
@@ -2212,7 +2246,7 @@ int main(int argc, char **argv)
                 browse_go_parent();
             } else {
                 mode = MODE_BROWSE;
-                query_clean();
+                query_clear();
                 set_status("");
                 refresh_flags |= RF_TITLE | RF_STATUS | RF_LIST | RF_BUTTONS;
             }
@@ -2298,6 +2332,15 @@ int main(int argc, char **argv)
             size_t len = strlen(query);
             if (len > 0) {
                 query_backspace();
+                refresh_flags |= RF_INPUT | RF_STATUS | RF_LIST;
+            }
+            break;
+        }
+
+        case K_CTRL_R: {
+            size_t len = strlen(query);
+            if (len > 0) {
+                query_clear();
                 refresh_flags |= RF_INPUT | RF_STATUS | RF_LIST;
             }
             break;

@@ -125,8 +125,8 @@ bind \cg 'mcd; commandline -f repaint'
 - `Right` enter selected directory
 - `Ctrl+P` change resolve mode
 - `Enter` confirm and output path
-- `Esc` / `Ctrl+C` quit
-- Type to filter, `Backspace` to delete
+- `Esc` / `Ctrl+C` / `Ctrl+Q` quit
+- Type to filter, `Backspace` to delete, `Ctrl+R` to clear
 
 ## Mouse
 
